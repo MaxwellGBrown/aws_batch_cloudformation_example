@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  AWS Batch Cloudformation Template Example
+
+  Builds a Small VPC with a small public Subnet to host ec2 instances for
+  AWS Batch. 
+
+  Using that VPC & subnet, spins up a Compute Environment, Job Queue, and
+  Job Definition to run.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC Cloudformation
+  # TODO Move this to it's own template and specify VPC/Subnet as input to this
+  #      template. This way you can use the default VPC & Subnet if you choose.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:  10.0.0.0/24  # 10.0.0.0 - 10.0.0.255
+
+  PublicSubnetInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref PublicSubnetInternetGateway
+      VpcId: !Ref VPC
+    DependsOn:
+      - VPC
+      - PublicSubnetInternetGateway
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+    DependsOn: VPC
+
+  PublicSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0  # Route all traffic freely
+      GatewayId: !Ref PublicSubnetInternetGateway
+      RouteTableId: !Ref PublicSubnetRouteTable
+    DependsOn: 
+      - PublicSubnetRouteTable
+      - VpcGatewayAttachment
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/26  # 10.0.0.0 - 10.0.0.63
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+    DependsOn: VPC
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      SubnetId: !Ref PublicSubnet
+    DependsOn:
+      - PublicSubnetRouteTable
+      - PublicSubnet
+
+  # PublicSubnetFailover:
+  #   Type: AWS::EC2::Subnet
+  #   Properties:
+  #     CidrBlock: 10.0.0.64/26  # 10.0.0.64 - 10.0.0.127
+  #     MapPublicIpOnLaunch: true
+  #     VpcId: !Ref VPC
+  #     AvailabilityZone: !Select [1, !GetAZs ""]
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # AWS Batch Cloudformation
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} basic security group"
+      VpcId: !Ref VPC
+    DependsOn: VPC
+
+  DockerImageRepository:
+    Type: AWS::ECR::Repository
+
+  ComputeEnvironmentServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - batch.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Description: Role for compute environments to provision instances
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      # Managed Policies selected from the auto-created role from the documentation
+      # https://docs.aws.amazon.com/batch/latest/userguide/instance_IAM_role.html
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AWSOpsWorksCloudWatchLogs
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-EcsInstanceRole'
+          PolicyDocument: 
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - "ecs:Submit*"
+                Resource: "*"
+
+  EcsInstanceProfile:
+    # Allows the InstanceRole to pass role information to a started EC2
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EcsInstanceRole
+    DependsOn: EcsInstanceRole
+
+  SpotFleetIamRole:
+    # NOTE: For the Spot Role to work the service-linked role for EC2 Spot
+    #       must already be configured for the account.
+    #       See https://docs.aws.amazon.com/batch/latest/userguide/spot_fleet_IAM_role.html
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - spotfleet.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+  OnDemandComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeResources: 
+        Type: EC2
+        InstanceRole: !GetAtt EcsInstanceProfile.Arn
+        InstanceTypes: 
+          - c5.large  # 2 vCPUs, 4GiB, $0.0.85/hr
+          # - optimal
+        MaxvCpus: 2
+        MinvCpus: 0
+        Subnets:
+          - !Ref PublicSubnet
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+      ServiceRole: !GetAtt ComputeEnvironmentServiceRole.Arn
+      Type: MANAGED
+    DependsOn:
+      - PublicSubnet
+      - SecurityGroup
+      - ComputeEnvironmentServiceRole
+      - EcsInstanceRole
+
+  SpotInstanceComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeResources:
+        Type: SPOT
+        AllocationStrategy: BEST_FIT
+        BidPercentage: 50
+        SpotIamFleetRole: !GetAtt SpotFleetIamRole.Arn
+        InstanceRole: !GetAtt EcsInstanceProfile.Arn
+        InstanceTypes: 
+          - c5.large  # 2 vCPUs, 4GiB, $0.0.85/hr
+          # - optimal
+        MaxvCpus: 2
+        MinvCpus: 0
+        Subnets:
+          - !Ref PublicSubnet
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+      ServiceRole: !GetAtt ComputeEnvironmentServiceRole.Arn
+      Type: MANAGED
+    DependsOn:
+      - PublicSubnet
+      - SecurityGroup
+      - ComputeEnvironmentServiceRole
+      - EcsInstanceRole
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1  # Low scheduling preference vs other JobQueues on the same ComputeEnvironment
+      ComputeEnvironmentOrder:
+        # Prefer using the SpotInstanceComputeEnvironment.
+        # If it's capacity is full, consider the OnDemand ComputeEnvironment
+        - ComputeEnvironment: !Ref SpotInstanceComputeEnvironment
+          Order: 10
+        - ComputeEnvironment: !Ref OnDemandComputeEnvironment
+          Order: 1
+    DependsOn:
+      - OnDemandComputeEnvironment
+      - SpotInstanceComputeEnvironment
+
+  # JobRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - evs-tasks.amazonaws.com
+  #           Action:
+  #             - sts:AssumeRole
+  #     Policies:
+  #       - PolicyName: !Sub '${AWS::StackName}-JobRole'
+  #         PolicyDocument: 
+  #           Version: 2012-10-17
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - "s3:"
+  #               Resource: "*"
+
+  JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      ContainerProperties:
+        Command: ["30"]
+        Environment: 
+        - Name: FOO
+          Value: bar
+        Memory: 128
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DockerImageRepository}"
+        # m6g.large has 2 vCPU & 4GiB; we can fit two jobs with 1 vCPU & 2GiB
+        Vcpus: 1
+        Memory: 2000
+      # JobRoleArn: !GetAtt JobRole.Arn
+    DependsOn: 
+      - DockerImageRepository
+      # - JobRole
+  # ---------------------------------------------------------------------------
+
+Outputs:
+  JobImageURL:
+    Description: URL to tag docker images with for pushing
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DockerImageRepository}"
